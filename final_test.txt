@@ -1,0 +1,1 @@
+DocuGauge is an AI document intelligence platform built with FastAPI, PostgreSQL, and pgvector. It extracts text, generates 768-dimensional embeddings using nomic-embed-text, and performs vector similarity search. The local LLM engine is llama3.2, which answers questions and provides source citations.

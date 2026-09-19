@@ -1,0 +1,29 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+*.env
+
+# React / Node Dependencies & Builds
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database & OS Metadata
+*.db
+*.sqlite
+.DS_Store
+Thumbs.db
+
+# Test Artifacts
+test_docugauge_spec.txt
+sample_multipage_docs.pdf
+make_multipage_pdf.py
