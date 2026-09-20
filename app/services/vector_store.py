@@ -1,9 +1,19 @@
 from typing import List, Dict, Any, Optional
 import uuid
+import logging
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import text
 from app.models.document import DocumentChunk
 from app.services.embedding import embedding_service
+
+logger = logging.getLogger(__name__)
+
+try:
+    from flashrank import Ranker, RerankRequest
+    reranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
+except Exception as e:
+    logger.warning(f"FlashRank could not be initialized: {e}. Falling back to standard RRF ranking.")
+    reranker = None
 
 
 class VectorStoreService:
@@ -23,18 +33,18 @@ class VectorStoreService:
         parsed_chunks = []
         for i, c in enumerate(input_chunks):
             if isinstance(c, dict):
-                text = c.get("content", "")
+                text_val = c.get("content", "")
                 idx = c.get("chunk_index", i)
                 page = c.get("page_number")
             else:
-                text = getattr(c, "content", "")
+                text_val = getattr(c, "content", "")
                 idx = getattr(c, "chunk_index", i)
                 page = getattr(c, "page_number", None)
 
-            contents.append(text)
+            contents.append(text_val)
             parsed_chunks.append({
                 "chunk_index": idx,
-                "content": text,
+                "content": text_val,
                 "page_number": page
             })
 
@@ -62,39 +72,82 @@ class VectorStoreService:
         document_id: Optional[uuid.UUID] = None
     ) -> List[Dict[str, Any]]:
         query_embedding = await embedding_service.get_embedding(query)
+        embedding_str = f"[{','.join(map(str, query_embedding))}]"
 
-        distance_col = DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
+        doc_filter_semantic = "WHERE document_id = :document_id" if document_id else ""
+        doc_filter_keyword = "AND document_id = :document_id" if document_id else ""
 
-        stmt = select(
-            DocumentChunk.id,
-            DocumentChunk.document_id,
-            DocumentChunk.chunk_index,
-            DocumentChunk.content,
-            DocumentChunk.page_number,
-            distance_col
-        )
+        rrf_sql = text(f"""
+            WITH semantic_search AS (
+                SELECT id, document_id, chunk_index, content, page_number,
+                       ROW_NUMBER() OVER (ORDER BY embedding <=> cast(:query_embedding as vector)) AS rank
+                FROM document_chunks
+                {doc_filter_semantic}
+                LIMIT 20
+            ),
+            keyword_search AS (
+                SELECT id, document_id, chunk_index, content, page_number,
+                       ROW_NUMBER() OVER (
+                           ORDER BY ts_rank(content_fts, plainto_tsquery('english', :query_text)) DESC
+                       ) AS rank
+                FROM document_chunks
+                WHERE content_fts @@ plainto_tsquery('english', :query_text)
+                {doc_filter_keyword}
+                LIMIT 20
+            )
+            SELECT 
+                COALESCE(s.id, k.id) AS id,
+                COALESCE(s.document_id, k.document_id) AS document_id,
+                COALESCE(s.chunk_index, k.chunk_index) AS chunk_index,
+                COALESCE(s.content, k.content) AS content,
+                COALESCE(s.page_number, k.page_number) AS page_number,
+                (COALESCE(1.0 / (60 + s.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) AS rrf_score
+            FROM semantic_search s
+            FULL OUTER JOIN keyword_search k ON s.id = k.id
+            ORDER BY rrf_score DESC
+            LIMIT 15;
+        """)
 
+        params: Dict[str, Any] = {
+            "query_embedding": embedding_str,
+            "query_text": query,
+        }
         if document_id:
-            stmt = stmt.where(DocumentChunk.document_id == document_id)
+            params["document_id"] = document_id
 
-        stmt = stmt.order_by(distance_col).limit(limit)
-
-        result = await session.execute(stmt)
+        result = await session.execute(rrf_sql, params)
         rows = result.fetchall()
 
         retrieved = []
         for row in rows:
-            dist = row.distance if row.distance is not None else 1.0
             retrieved.append({
                 "chunk_id": str(row.id),
                 "document_id": str(row.document_id),
                 "chunk_index": row.chunk_index,
                 "content": row.content,
                 "page_number": row.page_number,
-                "score": float(1.0 - dist)
+                "score": float(row.rrf_score)
             })
 
-        return retrieved
+        if not retrieved:
+            return []
+
+        if reranker is not None and len(retrieved) > 1:
+            try:
+                passages = [{"id": r["chunk_id"], "text": r["content"], "meta": r} for r in retrieved]
+                rerank_req = RerankRequest(query=query, passages=passages)
+                reranked_results = reranker.rerank(rerank_req)
+                
+                final_results = []
+                for res in reranked_results[:limit]:
+                    item = res["meta"]
+                    item["score"] = float(res.get("score", item["score"]))
+                    final_results.append(item)
+                return final_results
+            except Exception as e:
+                logger.warning(f"Reranking encountered an error: {e}. Using RRF ranking.")
+
+        return retrieved[:limit]
 
 
 vector_store_service = VectorStoreService()
